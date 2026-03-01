@@ -50,4 +50,9 @@ urlpatterns = [
     
     # Service Centers endpoint
     path('api/service-centers/nearby/', views.get_nearby_service_centers, name='get_nearby_service_centers'),
+    
+    # PC Compatibility Checker endpoints
+    path('api/compatibility/scan/', views.scan_hardware_specs, name='scan_hardware_specs'),
+    path('api/compatibility/check/', views.check_upgrade_compatibility, name='check_upgrade_compatibility'),
+    path('api/compatibility/recommendations/', views.get_upgrade_recommendations, name='get_upgrade_recommendations'),
 ]

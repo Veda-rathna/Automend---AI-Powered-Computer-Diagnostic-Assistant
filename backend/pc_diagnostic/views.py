@@ -4,6 +4,7 @@ from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.conf import settings
 from django.http import FileResponse, Http404
+from typing import Dict, List, Any
 import random
 import requests
 import os
@@ -22,12 +23,14 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from .hardware_monitor import HardwareMonitor
 from .report_generator import ReportGenerator
 from .hardware_hash import HardwareHashProtection
+from .hardware_compatibility import HardwareCompatibilityChecker
 
 # Import LLM provider factory
 from .llm.factory import get_llm_provider
 
 # Initialize hardware monitor and report generator
 hardware_monitor = HardwareMonitor()
+hardware_compatibility = HardwareCompatibilityChecker()
 report_generator = ReportGenerator()
 hardware_hash_protection = HardwareHashProtection()
 
@@ -446,15 +449,29 @@ Focus on issue-specific telemetry only. Be decisive. Provide actionable next ste
                         formatted_tasks = []
                         
                         for i, task_result in enumerate(task_results, 1):
+                            # Limit the size of details to prevent response bloat
+                            details = task_result.get('details', {})
+                            if isinstance(details, dict):
+                                # Limit string lengths in details
+                                limited_details = {}
+                                for key, value in details.items():
+                                    if isinstance(value, str) and len(value) > 500:
+                                        limited_details[key] = value[:500] + "... (truncated)"
+                                    elif isinstance(value, list) and len(value) > 10:
+                                        limited_details[key] = value[:10] + ["... (truncated)"]
+                                    else:
+                                        limited_details[key] = value
+                                details = limited_details
+                            
                             task_info = {
                                 'task_number': i,
                                 'task_name': task_result.get('task', 'Unknown Task'),
                                 'success': task_result.get('success', False),
                                 'status': "✅ Completed" if task_result.get('success') else "❌ Failed",
-                                'analysis': task_result.get('analysis', ''),
+                                'analysis': task_result.get('analysis', '')[:1000] if task_result.get('analysis') else '',  # Limit analysis length
                                 'error': task_result.get('error', ''),
                                 'recommendation': task_result.get('recommendation', ''),
-                                'details': task_result.get('details', {}),
+                                'details': details,
                                 'timestamp': task_result.get('timestamp', '')
                             }
                             formatted_tasks.append(task_info)
@@ -464,8 +481,7 @@ Focus on issue-specific telemetry only. Be decisive. Provide actionable next ste
                             'tasks_completed': mcp_result.get('tasks_completed', 0),
                             'tasks_failed': mcp_result.get('tasks_failed', 0),
                             'total_tasks': len(task_results),
-                            'tasks': formatted_tasks,  # Detailed task-by-task results
-                            'results': mcp_result.get('results', []),  # Original results
+                            'tasks': formatted_tasks,  # Detailed task-by-task results (size-limited)
                             'summary': mcp_result.get('summary', ''),
                             'execution_summary': orchestrator.get_execution_summary(mcp_result.get('results', []))
                         }
@@ -477,6 +493,8 @@ Focus on issue-specific telemetry only. Be decisive. Provide actionable next ste
                         }
                 except Exception as mcp_error:
                     print(f"MCP execution error: {str(mcp_error)}")
+                    import traceback
+                    traceback.print_exc()
                     response_data['mcp_execution'] = {
                         'executed': False,
                         'error': str(mcp_error),
@@ -504,6 +522,23 @@ Focus on issue-specific telemetry only. Be decisive. Provide actionable next ste
                     print(f"Report generation error: {str(report_error)}")
                     response_data['report_error'] = f"Failed to generate reports: {str(report_error)}"
             
+            # Ensure all response data is JSON serializable and log response size
+            try:
+                import sys
+                response_json = json.dumps(response_data, default=str)
+                response_size = sys.getsizeof(response_json)
+                print(f"✅ Response prepared: {response_size / 1024:.2f} KB")
+                print(f"📤 Sending response to frontend with keys: {list(response_data.keys())}")
+                
+                # If response is very large, warn about it
+                if response_size > 500000:  # 500KB
+                    print(f"⚠️ Large response size: {response_size / 1024:.2f} KB - may cause network issues")
+            except Exception as json_err:
+                print(f"❌ Response serialization check failed: {str(json_err)}")
+                import traceback
+                traceback.print_exc()
+            
+            print(f"🚀 Returning Response object to Django...")
             return Response(response_data)
                 
         except Exception as provider_error:
@@ -999,4 +1034,254 @@ def get_nearby_service_centers(request):
             'success': False,
             'error': f'Failed to fetch service centers: {str(e)}'
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['GET'])
+def scan_hardware_specs(request):
+    """
+    Scan and return detailed hardware specifications for compatibility checking
+    """
+    try:
+        specs = hardware_compatibility.get_detailed_hardware_specs()
+        
+        # Calculate power requirements
+        power_info = hardware_compatibility.calculate_power_requirements(specs)
+        specs['power_requirements'] = power_info
+        
+        return Response({
+            'success': True,
+            'hardware_specs': specs,
+            'detected_fields': _get_detected_fields(specs),
+            'missing_fields': _get_missing_fields(specs),
+        })
+        
+    except Exception as e:
+        return Response({
+            'success': False,
+            'error': f'Failed to scan hardware: {str(e)}'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+def check_upgrade_compatibility(request):
+    """
+    Check if a proposed upgrade is compatible with existing hardware
+    """
+    try:
+        # Get current system specs
+        current_system = request.data.get('current_system', {})
+        proposed_upgrade = request.data.get('proposed_upgrade', {})
+        user_inputs = request.data.get('user_inputs', {})
+        
+        # If no current system provided, scan it
+        if not current_system:
+            current_system = hardware_compatibility.get_detailed_hardware_specs()
+        
+        # Merge user inputs into current system
+        complete_system = _merge_dict_deep(current_system, user_inputs)
+        
+        # Build compatibility analysis prompt
+        compatibility_prompt = f"""
+You are a PC hardware compatibility expert. Analyze this upgrade scenario:
+
+**Current System:**
+```json
+{json.dumps(complete_system, indent=2)}
+```
+
+**Proposed Upgrade:**
+```json
+{json.dumps(proposed_upgrade, indent=2)}
+```
+
+Please analyze and provide:
+
+1. **Compatibility Status**: Is this upgrade compatible? (YES/NO/PARTIAL)
+
+2. **Detailed Analysis**: 
+   - Physical compatibility (sockets, slots, dimensions)
+   - Power requirements (PSU adequacy)
+   - Potential bottlenecks
+   - BIOS/firmware considerations
+   - Cooling requirements
+
+3. **Warnings**: List any compatibility issues or concerns
+
+4. **Recommendations**: 
+   - Better alternatives if available
+   - What else needs upgrading
+   - Budget-friendly options
+
+5. **Performance Estimate**: Expected performance improvement (percentage or qualitative)
+
+6. **Installation Notes**: Any special installation requirements
+
+Provide your response in a structured format with clear sections.
+"""
+        
+        # Use LLM to analyze compatibility
+        llm_provider = get_llm_provider()
+        result = llm_provider.complete(compatibility_prompt, temperature=0.7, max_tokens=4000)
+        
+        # Parse the response
+        analysis = result.get('content', 'Analysis completed')
+        
+        # Extract compatibility status from response
+        is_compatible = 'YES' in analysis.upper() and 'COMPATIBLE' in analysis.upper()
+        has_warnings = 'WARNING' in analysis.upper() or 'ISSUE' in analysis.upper()
+        
+        return Response({
+            'success': True,
+            'compatible': is_compatible,
+            'has_warnings': has_warnings,
+            'analysis': analysis,
+            'current_system': complete_system,
+            'proposed_upgrade': proposed_upgrade,
+            'llm_provider': llm_provider.get_provider_name(),
+        })
+        
+    except Exception as e:
+        return Response({
+            'success': False,
+            'error': f'Failed to check compatibility: {str(e)}'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+def get_upgrade_recommendations(request):
+    """
+    Get AI-powered upgrade recommendations based on current system and budget
+    """
+    try:
+        current_system = request.data.get('current_system', {})
+        budget = request.data.get('budget', 0)
+        upgrade_goal = request.data.get('goal', 'general performance')
+        user_inputs = request.data.get('user_inputs', {})
+        
+        # If no current system provided, scan it
+        if not current_system:
+            current_system = hardware_compatibility.get_detailed_hardware_specs()
+        
+        # Merge user inputs
+        complete_system = _merge_dict_deep(current_system, user_inputs)
+        
+        # Build recommendation prompt
+        recommendation_prompt = f"""
+You are a PC hardware upgrade consultant for the Indian market. Based on this system, provide upgrade recommendations:
+
+**Current System:**
+```json
+{json.dumps(complete_system, indent=2)}
+```
+
+**Budget**: ₹{budget:,.0f} INR (Indian Rupees)
+**Upgrade Goal**: {upgrade_goal}
+
+Please provide:
+
+1. **Priority Upgrades**: What should be upgraded first and why?
+
+2. **Specific Component Recommendations**: 
+   - Exact models/specifications available in India
+   - Expected price range in INR
+   - Why this component
+
+3. **Budget Allocation**: How to split the ₹{budget:,.0f} budget across components
+
+4. **Compatibility Notes**: Ensure all recommendations are compatible
+
+5. **Expected Performance Gains**: What improvements to expect
+
+6. **Future-Proofing**: How long will these upgrades last?
+
+7. **Alternative Options**: 
+   - Budget-friendly alternatives available in India
+   - Premium options if budget allows
+
+8. **Where to Buy**: Mention reliable Indian retailers (Amazon.in, Flipkart, MDComputers, Vedant Computers, etc.)
+
+Provide practical, specific recommendations with current Indian market prices and availability.
+"""
+        
+        # Use LLM to generate recommendations
+        llm_provider = get_llm_provider()
+        result = llm_provider.complete(recommendation_prompt, temperature=0.7, max_tokens=4000)
+        
+        recommendations = result.get('content', 'Recommendations generated')
+        
+        return Response({
+            'success': True,
+            'recommendations': recommendations,
+            'current_system': complete_system,
+            'budget': budget,
+            'goal': upgrade_goal,
+            'llm_provider': llm_provider.get_provider_name(),
+        })
+        
+    except Exception as e:
+        return Response({
+            'success': False,
+            'error': f'Failed to generate recommendations: {str(e)}'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+def _get_detected_fields(specs: Dict[str, Any]) -> List[str]:
+    """Get list of successfully detected hardware fields"""
+    detected = []
+    
+    def check_dict(d, prefix=''):
+        for key, value in d.items():
+            full_key = f"{prefix}.{key}" if prefix else key
+            if isinstance(value, dict):
+                check_dict(value, full_key)
+            elif value is not None and value != '' and value != []:
+                detected.append(full_key)
+    
+    check_dict(specs)
+    return detected
+
+
+def _get_missing_fields(specs: Dict[str, Any]) -> List[str]:
+    """Get list of fields that need user input"""
+    missing = []
+    
+    # Important fields that are typically None and need user input
+    important_fields = [
+        'psu.wattage',
+        'psu.efficiency',
+        'case.form_factor',
+        'case.gpu_clearance_mm',
+        'motherboard.ram_slots',
+        'motherboard.max_ram_gb',
+    ]
+    
+    def get_nested_value(d, path):
+        keys = path.split('.')
+        value = d
+        for key in keys:
+            if isinstance(value, dict):
+                value = value.get(key)
+            else:
+                return None
+        return value
+    
+    for field in important_fields:
+        value = get_nested_value(specs, field)
+        if value is None or value == '':
+            missing.append(field)
+    
+    return missing
+
+
+def _merge_dict_deep(base: Dict, updates: Dict) -> Dict:
+    """Deep merge two dictionaries"""
+    result = base.copy()
+    
+    for key, value in updates.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _merge_dict_deep(result[key], value)
+        else:
+            result[key] = value
+    
+    return result
 
