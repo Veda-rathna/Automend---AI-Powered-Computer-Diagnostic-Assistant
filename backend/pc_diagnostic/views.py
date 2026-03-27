@@ -15,6 +15,7 @@ from datetime import datetime
 import csv
 import math
 import urllib3
+import re
 
 # Disable SSL warnings for cloudflare tunnels
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -129,6 +130,82 @@ def generate_mock_analysis(issue_description, telemetry_data):
     return mock_response
 
 
+def estimate_repair_cost(input_text: str, is_hardware_issue: bool = False, hardware_component: str = None) -> Dict[str, Any]:
+    """Estimate likely repair cost range based on issue text and detected component."""
+    issue_text = f"{input_text or ''} {hardware_component or ''}".lower()
+
+    cost_matrix = [
+        ({'ram', 'memory', 'upgrade ram'}, {'min': 3000, 'max': 12000, 'currency': 'INR', 'reason': 'RAM replacement/upgrade and labor if required'}),
+        ({'ssd', 'hdd', 'disk', 'storage', 'hard drive'}, {'min': 4000, 'max': 18000, 'currency': 'INR', 'reason': 'Storage replacement, OS migration/reinstall'}),
+        ({'gpu', 'graphics', 'artifact', 'screen lines', 'display card'}, {'min': 15000, 'max': 85000, 'currency': 'INR', 'reason': 'GPU repair/replacement depending on model'}),
+        ({'screen', 'display', 'lcd', 'panel', 'monitor'}, {'min': 7000, 'max': 35000, 'currency': 'INR', 'reason': 'Display panel/cable diagnostics and replacement'}),
+        ({'motherboard', 'mainboard', 'no power', 'not turning on'}, {'min': 12000, 'max': 60000, 'currency': 'INR', 'reason': 'Board-level diagnostics and component replacement'}),
+        ({'fan', 'overheat', 'thermal', 'heating', 'temperature'}, {'min': 1500, 'max': 9000, 'currency': 'INR', 'reason': 'Cooling cleanup, thermal paste, fan replacement'}),
+        ({'battery', 'charging'}, {'min': 2500, 'max': 12000, 'currency': 'INR', 'reason': 'Battery replacement and charging circuit checks'}),
+        ({'driver', 'software', 'windows update', 'performance', 'slow', 'malware'}, {'min': 0, 'max': 4000, 'currency': 'INR', 'reason': 'Software troubleshooting may be free or low-cost'}),
+    ]
+
+    for keywords, estimate in cost_matrix:
+        if any(keyword in issue_text for keyword in keywords):
+            return {
+                'applies': True,
+                'estimated_min': estimate['min'],
+                'estimated_max': estimate['max'],
+                'currency': estimate['currency'],
+                'reason': estimate['reason'],
+                'confidence': 'medium',
+                'service_required': is_hardware_issue,
+                'note': 'Actual pricing varies by city, brand, and parts availability in India.'
+            }
+
+    if is_hardware_issue:
+        return {
+            'applies': True,
+            'estimated_min': 3000,
+            'estimated_max': 15000,
+            'currency': 'INR',
+            'reason': 'General hardware diagnostics and repair labor',
+            'confidence': 'low',
+            'service_required': True,
+            'note': 'Actual pricing varies by city, brand, and parts availability in India.'
+        }
+
+    return {
+        'applies': True,
+        'estimated_min': 0,
+        'estimated_max': 2500,
+        'currency': 'INR',
+        'reason': 'Likely software fix with minimal or no parts cost',
+        'confidence': 'low',
+        'service_required': False,
+        'note': 'Actual pricing varies by city and support provider in India.'
+    }
+
+
+def add_cost_to_prediction(prediction: str, cost_estimate: Dict[str, Any]) -> str:
+    """Append repair pricing details to chatbot output if not already present."""
+    if not prediction or not cost_estimate.get('applies'):
+        return prediction
+
+    # Avoid duplicating if the model already included clear pricing text.
+    if re.search(r"\b(price|cost|estimated\s+cost|repair\s+cost|inr|rupees)\b|\$\s*\d+|₹\s*\d+", prediction, re.IGNORECASE):
+        return prediction
+
+    min_cost = cost_estimate.get('estimated_min')
+    max_cost = cost_estimate.get('estimated_max')
+    currency = cost_estimate.get('currency', 'INR')
+    reason = cost_estimate.get('reason', '')
+    note = cost_estimate.get('note', '')
+
+    cost_block = (
+        f"\n\n**Estimated Repair Price:**\n"
+        f"- Approximate range: {min_cost:,}-{max_cost:,} {currency}\n"
+        f"- Includes: {reason}\n"
+        f"- Note: {note}"
+    )
+    return prediction + cost_block
+
+
 @api_view(['POST'])
 def diagnose(request):
     """
@@ -194,7 +271,8 @@ def predict(request):
         input_text = request.data.get('input_text', '')
         provided_telemetry = request.data.get('telemetry_data', None)
         generate_report = request.data.get('generate_report', False)
-        execute_mcp = request.data.get('execute_mcp_tasks', True)  # Auto-execute by default
+        # MCP execution disabled globally for performance.
+        execute_mcp = False
         
         if not input_text:
             return Response(
@@ -256,6 +334,7 @@ CORE RULES:
 2. Classify issue as HARDWARE or SOFTWARE
 3. Generate MCP tasks ONLY for SOFTWARE issues that can be fixed programmatically
 4. For HARDWARE issues: skip MCP tasks, recommend service center
+5. Include estimated repair price when a fix may involve paid parts, labor, or service
 
 HARDWARE INDICATORS:
 - Abnormal temps (CPU >85°C, GPU >80°C)
@@ -278,6 +357,7 @@ RESPONSE FORMAT:
 - Root Cause: [specific component/service]
 - Key Telemetry: [show only issue-relevant metrics with values]
 - Confidence: [High/Medium/Low]
+- Estimated Repair Price: [amount/range with currency, or say No cost if likely free]
 
 **Analysis:**
 Explain correlation between symptoms and telemetry data.
@@ -390,6 +470,9 @@ Focus on issue-specific telemetry only. Be decisive. Provide actionable next ste
                 print(f"Warning: Could not parse MCP tasks for hardware detection: {str(parse_error)}")
             
             # Build response data
+            cost_estimate = estimate_repair_cost(input_text, is_hardware_issue, hardware_component)
+            prediction = add_cost_to_prediction(prediction, cost_estimate)
+
             response_data = {
                 'success': True,
                 'message': prediction,
@@ -407,6 +490,7 @@ Focus on issue-specific telemetry only. Be decisive. Provide actionable next ste
                     'memory_usage': telemetry_data.get('memory', {}).get('percentage'),
                     'issue_specific_data': list(telemetry_data.get('issue_specific', {}).keys())
                 },
+                'repair_cost_estimate': cost_estimate,
                 'usage': usage,
                 'metadata': metadata
             }
@@ -434,72 +518,10 @@ Focus on issue-specific telemetry only. Be decisive. Provide actionable next ste
                 }
                 print(f"[HW] Added hardware navigation options to response")
             
-            # Execute MCP tasks if requested
-            if execute_mcp:
-                try:
-                    from autogen_integration.orchestrator import AutoGenOrchestrator
-                    
-                    print("Executing MCP tasks...")
-                    orchestrator = AutoGenOrchestrator()
-                    mcp_result = orchestrator.execute_mcp_tasks(prediction, use_autogen=False)
-                    
-                    if mcp_result.get('success'):
-                        # Format detailed task results for display in chat
-                        task_results = mcp_result.get('results', [])
-                        formatted_tasks = []
-                        
-                        for i, task_result in enumerate(task_results, 1):
-                            # Limit the size of details to prevent response bloat
-                            details = task_result.get('details', {})
-                            if isinstance(details, dict):
-                                # Limit string lengths in details
-                                limited_details = {}
-                                for key, value in details.items():
-                                    if isinstance(value, str) and len(value) > 500:
-                                        limited_details[key] = value[:500] + "... (truncated)"
-                                    elif isinstance(value, list) and len(value) > 10:
-                                        limited_details[key] = value[:10] + ["... (truncated)"]
-                                    else:
-                                        limited_details[key] = value
-                                details = limited_details
-                            
-                            task_info = {
-                                'task_number': i,
-                                'task_name': task_result.get('task', 'Unknown Task'),
-                                'success': task_result.get('success', False),
-                                'status': "✅ Completed" if task_result.get('success') else "❌ Failed",
-                                'analysis': task_result.get('analysis', '')[:1000] if task_result.get('analysis') else '',  # Limit analysis length
-                                'error': task_result.get('error', ''),
-                                'recommendation': task_result.get('recommendation', ''),
-                                'details': details,
-                                'timestamp': task_result.get('timestamp', '')
-                            }
-                            formatted_tasks.append(task_info)
-                        
-                        response_data['mcp_execution'] = {
-                            'executed': True,
-                            'tasks_completed': mcp_result.get('tasks_completed', 0),
-                            'tasks_failed': mcp_result.get('tasks_failed', 0),
-                            'total_tasks': len(task_results),
-                            'tasks': formatted_tasks,  # Detailed task-by-task results (size-limited)
-                            'summary': mcp_result.get('summary', ''),
-                            'execution_summary': orchestrator.get_execution_summary(mcp_result.get('results', []))
-                        }
-                        print(f"MCP tasks executed: {mcp_result.get('tasks_completed', 0)} completed")
-                    else:
-                        response_data['mcp_execution'] = {
-                            'executed': False,
-                            'note': mcp_result.get('error', 'No MCP tasks found in response')
-                        }
-                except Exception as mcp_error:
-                    print(f"MCP execution error: {str(mcp_error)}")
-                    import traceback
-                    traceback.print_exc()
-                    response_data['mcp_execution'] = {
-                        'executed': False,
-                        'error': str(mcp_error),
-                        'note': 'MCP task execution failed - diagnostics available via /api/mcp/execute endpoint'
-                    }
+            response_data['mcp_execution'] = {
+                'executed': False,
+                'note': 'MCP task execution disabled for performance'
+            }
             
             # Generate reports if requested
             if generate_report:
@@ -575,6 +597,9 @@ Focus on issue-specific telemetry only. Be decisive. Provide actionable next ste
             # Also check telemetry for hardware issues
             if telemetry_data.get('cpu', {}).get('temperature', 0) > 85:
                 is_hardware_issue = True
+
+            cost_estimate = estimate_repair_cost(input_text, is_hardware_issue)
+            prediction = add_cost_to_prediction(prediction, cost_estimate)
             
             response_data = {
                 'success': True,
@@ -593,6 +618,7 @@ Focus on issue-specific telemetry only. Be decisive. Provide actionable next ste
                     'memory_usage': telemetry_data.get('memory', {}).get('percentage'),
                     'issue_specific_data': list(telemetry_data.get('issue_specific', {}).keys())
                 },
+                'repair_cost_estimate': cost_estimate,
                 'usage': usage,
                 'metadata': metadata
             }

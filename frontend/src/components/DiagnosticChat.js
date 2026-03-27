@@ -92,7 +92,8 @@ const DiagnosticChat = () => {
           model: msg.model_name,
           finishReason: msg.finish_reason,
           usage: msg.tokens_used ? { total_tokens: msg.tokens_used } : null,
-          session_id: msg.session_id
+          session_id: msg.session_id,
+          repairCostEstimate: msg.repair_cost_estimate || null
         }));
         
         setMessages(loadedMessages);
@@ -157,7 +158,8 @@ const DiagnosticChat = () => {
           timestamp: new Date().toISOString(),
           mcpExecution: data.mcp_execution, // Add MCP execution results
           isHardwareIssue: data.is_hardware_issue, // Hardware issue flag
-          hardwareIssueDetails: data.hardware_issue_details // Hardware navigation options
+          hardwareIssueDetails: data.hardware_issue_details, // Hardware navigation options
+          repairCostEstimate: data.repair_cost_estimate || null // Estimated repair pricing
         };
         
         setMessages(prev => [...prev, aiMessage]);
@@ -369,6 +371,25 @@ const DiagnosticChat = () => {
                       </div>
                     </button>
                   </div>
+                </div>
+              )}
+
+              {/* Display Repair Cost Estimate */}
+              {msg.type === 'assistant' && msg.repairCostEstimate && msg.repairCostEstimate.applies && (
+                <div className="repair-cost-card">
+                  <div className="repair-cost-header">
+                    <span className="repair-cost-icon">💵</span>
+                    <h4>Estimated Repair Cost</h4>
+                  </div>
+                  <p className="repair-cost-range">
+                    {msg.repairCostEstimate.estimated_min} - {msg.repairCostEstimate.estimated_max} {msg.repairCostEstimate.currency}
+                  </p>
+                  {msg.repairCostEstimate.reason && (
+                    <p className="repair-cost-reason">{msg.repairCostEstimate.reason}</p>
+                  )}
+                  {msg.repairCostEstimate.note && (
+                    <p className="repair-cost-note">{msg.repairCostEstimate.note}</p>
+                  )}
                 </div>
               )}
               
