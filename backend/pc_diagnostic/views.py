@@ -4,6 +4,7 @@ from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.conf import settings
 from django.http import FileResponse, Http404
+from typing import Dict, List, Any
 import random
 import requests
 import os
@@ -14,6 +15,7 @@ from datetime import datetime
 import csv
 import math
 import urllib3
+import re
 
 # Disable SSL warnings for cloudflare tunnels
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -22,12 +24,14 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from .hardware_monitor import HardwareMonitor
 from .report_generator import ReportGenerator
 from .hardware_hash import HardwareHashProtection
+from .hardware_compatibility import HardwareCompatibilityChecker
 
 # Import LLM provider factory
 from .llm.factory import get_llm_provider
 
 # Initialize hardware monitor and report generator
 hardware_monitor = HardwareMonitor()
+hardware_compatibility = HardwareCompatibilityChecker()
 report_generator = ReportGenerator()
 hardware_hash_protection = HardwareHashProtection()
 
@@ -126,6 +130,82 @@ def generate_mock_analysis(issue_description, telemetry_data):
     return mock_response
 
 
+def estimate_repair_cost(input_text: str, is_hardware_issue: bool = False, hardware_component: str = None) -> Dict[str, Any]:
+    """Estimate likely repair cost range based on issue text and detected component."""
+    issue_text = f"{input_text or ''} {hardware_component or ''}".lower()
+
+    cost_matrix = [
+        ({'ram', 'memory', 'upgrade ram'}, {'min': 3000, 'max': 12000, 'currency': 'INR', 'reason': 'RAM replacement/upgrade and labor if required'}),
+        ({'ssd', 'hdd', 'disk', 'storage', 'hard drive'}, {'min': 4000, 'max': 18000, 'currency': 'INR', 'reason': 'Storage replacement, OS migration/reinstall'}),
+        ({'gpu', 'graphics', 'artifact', 'screen lines', 'display card'}, {'min': 15000, 'max': 85000, 'currency': 'INR', 'reason': 'GPU repair/replacement depending on model'}),
+        ({'screen', 'display', 'lcd', 'panel', 'monitor'}, {'min': 7000, 'max': 35000, 'currency': 'INR', 'reason': 'Display panel/cable diagnostics and replacement'}),
+        ({'motherboard', 'mainboard', 'no power', 'not turning on'}, {'min': 12000, 'max': 60000, 'currency': 'INR', 'reason': 'Board-level diagnostics and component replacement'}),
+        ({'fan', 'overheat', 'thermal', 'heating', 'temperature'}, {'min': 1500, 'max': 9000, 'currency': 'INR', 'reason': 'Cooling cleanup, thermal paste, fan replacement'}),
+        ({'battery', 'charging'}, {'min': 2500, 'max': 12000, 'currency': 'INR', 'reason': 'Battery replacement and charging circuit checks'}),
+        ({'driver', 'software', 'windows update', 'performance', 'slow', 'malware'}, {'min': 0, 'max': 4000, 'currency': 'INR', 'reason': 'Software troubleshooting may be free or low-cost'}),
+    ]
+
+    for keywords, estimate in cost_matrix:
+        if any(keyword in issue_text for keyword in keywords):
+            return {
+                'applies': True,
+                'estimated_min': estimate['min'],
+                'estimated_max': estimate['max'],
+                'currency': estimate['currency'],
+                'reason': estimate['reason'],
+                'confidence': 'medium',
+                'service_required': is_hardware_issue,
+                'note': 'Actual pricing varies by city, brand, and parts availability in India.'
+            }
+
+    if is_hardware_issue:
+        return {
+            'applies': True,
+            'estimated_min': 3000,
+            'estimated_max': 15000,
+            'currency': 'INR',
+            'reason': 'General hardware diagnostics and repair labor',
+            'confidence': 'low',
+            'service_required': True,
+            'note': 'Actual pricing varies by city, brand, and parts availability in India.'
+        }
+
+    return {
+        'applies': True,
+        'estimated_min': 0,
+        'estimated_max': 2500,
+        'currency': 'INR',
+        'reason': 'Likely software fix with minimal or no parts cost',
+        'confidence': 'low',
+        'service_required': False,
+        'note': 'Actual pricing varies by city and support provider in India.'
+    }
+
+
+def add_cost_to_prediction(prediction: str, cost_estimate: Dict[str, Any]) -> str:
+    """Append repair pricing details to chatbot output if not already present."""
+    if not prediction or not cost_estimate.get('applies'):
+        return prediction
+
+    # Avoid duplicating if the model already included clear pricing text.
+    if re.search(r"\b(price|cost|estimated\s+cost|repair\s+cost|inr|rupees)\b|\$\s*\d+|₹\s*\d+", prediction, re.IGNORECASE):
+        return prediction
+
+    min_cost = cost_estimate.get('estimated_min')
+    max_cost = cost_estimate.get('estimated_max')
+    currency = cost_estimate.get('currency', 'INR')
+    reason = cost_estimate.get('reason', '')
+    note = cost_estimate.get('note', '')
+
+    cost_block = (
+        f"\n\n**Estimated Repair Price:**\n"
+        f"- Approximate range: {min_cost:,}-{max_cost:,} {currency}\n"
+        f"- Includes: {reason}\n"
+        f"- Note: {note}"
+    )
+    return prediction + cost_block
+
+
 @api_view(['POST'])
 def diagnose(request):
     """
@@ -191,7 +271,8 @@ def predict(request):
         input_text = request.data.get('input_text', '')
         provided_telemetry = request.data.get('telemetry_data', None)
         generate_report = request.data.get('generate_report', False)
-        execute_mcp = request.data.get('execute_mcp_tasks', True)  # Auto-execute by default
+        # MCP execution disabled globally for performance.
+        execute_mcp = False
         
         if not input_text:
             return Response(
@@ -253,6 +334,7 @@ CORE RULES:
 2. Classify issue as HARDWARE or SOFTWARE
 3. Generate MCP tasks ONLY for SOFTWARE issues that can be fixed programmatically
 4. For HARDWARE issues: skip MCP tasks, recommend service center
+5. Include estimated repair price when a fix may involve paid parts, labor, or service
 
 HARDWARE INDICATORS:
 - Abnormal temps (CPU >85°C, GPU >80°C)
@@ -275,6 +357,7 @@ RESPONSE FORMAT:
 - Root Cause: [specific component/service]
 - Key Telemetry: [show only issue-relevant metrics with values]
 - Confidence: [High/Medium/Low]
+- Estimated Repair Price: [amount/range with currency, or say No cost if likely free]
 
 **Analysis:**
 Explain correlation between symptoms and telemetry data.
@@ -387,6 +470,9 @@ Focus on issue-specific telemetry only. Be decisive. Provide actionable next ste
                 print(f"Warning: Could not parse MCP tasks for hardware detection: {str(parse_error)}")
             
             # Build response data
+            cost_estimate = estimate_repair_cost(input_text, is_hardware_issue, hardware_component)
+            prediction = add_cost_to_prediction(prediction, cost_estimate)
+
             response_data = {
                 'success': True,
                 'message': prediction,
@@ -404,6 +490,7 @@ Focus on issue-specific telemetry only. Be decisive. Provide actionable next ste
                     'memory_usage': telemetry_data.get('memory', {}).get('percentage'),
                     'issue_specific_data': list(telemetry_data.get('issue_specific', {}).keys())
                 },
+                'repair_cost_estimate': cost_estimate,
                 'usage': usage,
                 'metadata': metadata
             }
@@ -431,57 +518,10 @@ Focus on issue-specific telemetry only. Be decisive. Provide actionable next ste
                 }
                 print(f"[HW] Added hardware navigation options to response")
             
-            # Execute MCP tasks if requested
-            if execute_mcp:
-                try:
-                    from autogen_integration.orchestrator import AutoGenOrchestrator
-                    
-                    print("Executing MCP tasks...")
-                    orchestrator = AutoGenOrchestrator()
-                    mcp_result = orchestrator.execute_mcp_tasks(prediction, use_autogen=False)
-                    
-                    if mcp_result.get('success'):
-                        # Format detailed task results for display in chat
-                        task_results = mcp_result.get('results', [])
-                        formatted_tasks = []
-                        
-                        for i, task_result in enumerate(task_results, 1):
-                            task_info = {
-                                'task_number': i,
-                                'task_name': task_result.get('task', 'Unknown Task'),
-                                'success': task_result.get('success', False),
-                                'status': "✅ Completed" if task_result.get('success') else "❌ Failed",
-                                'analysis': task_result.get('analysis', ''),
-                                'error': task_result.get('error', ''),
-                                'recommendation': task_result.get('recommendation', ''),
-                                'details': task_result.get('details', {}),
-                                'timestamp': task_result.get('timestamp', '')
-                            }
-                            formatted_tasks.append(task_info)
-                        
-                        response_data['mcp_execution'] = {
-                            'executed': True,
-                            'tasks_completed': mcp_result.get('tasks_completed', 0),
-                            'tasks_failed': mcp_result.get('tasks_failed', 0),
-                            'total_tasks': len(task_results),
-                            'tasks': formatted_tasks,  # Detailed task-by-task results
-                            'results': mcp_result.get('results', []),  # Original results
-                            'summary': mcp_result.get('summary', ''),
-                            'execution_summary': orchestrator.get_execution_summary(mcp_result.get('results', []))
-                        }
-                        print(f"MCP tasks executed: {mcp_result.get('tasks_completed', 0)} completed")
-                    else:
-                        response_data['mcp_execution'] = {
-                            'executed': False,
-                            'note': mcp_result.get('error', 'No MCP tasks found in response')
-                        }
-                except Exception as mcp_error:
-                    print(f"MCP execution error: {str(mcp_error)}")
-                    response_data['mcp_execution'] = {
-                        'executed': False,
-                        'error': str(mcp_error),
-                        'note': 'MCP task execution failed - diagnostics available via /api/mcp/execute endpoint'
-                    }
+            response_data['mcp_execution'] = {
+                'executed': False,
+                'note': 'MCP task execution disabled for performance'
+            }
             
             # Generate reports if requested
             if generate_report:
@@ -504,6 +544,23 @@ Focus on issue-specific telemetry only. Be decisive. Provide actionable next ste
                     print(f"Report generation error: {str(report_error)}")
                     response_data['report_error'] = f"Failed to generate reports: {str(report_error)}"
             
+            # Ensure all response data is JSON serializable and log response size
+            try:
+                import sys
+                response_json = json.dumps(response_data, default=str)
+                response_size = sys.getsizeof(response_json)
+                print(f"✅ Response prepared: {response_size / 1024:.2f} KB")
+                print(f"📤 Sending response to frontend with keys: {list(response_data.keys())}")
+                
+                # If response is very large, warn about it
+                if response_size > 500000:  # 500KB
+                    print(f"⚠️ Large response size: {response_size / 1024:.2f} KB - may cause network issues")
+            except Exception as json_err:
+                print(f"❌ Response serialization check failed: {str(json_err)}")
+                import traceback
+                traceback.print_exc()
+            
+            print(f"🚀 Returning Response object to Django...")
             return Response(response_data)
                 
         except Exception as provider_error:
@@ -540,6 +597,9 @@ Focus on issue-specific telemetry only. Be decisive. Provide actionable next ste
             # Also check telemetry for hardware issues
             if telemetry_data.get('cpu', {}).get('temperature', 0) > 85:
                 is_hardware_issue = True
+
+            cost_estimate = estimate_repair_cost(input_text, is_hardware_issue)
+            prediction = add_cost_to_prediction(prediction, cost_estimate)
             
             response_data = {
                 'success': True,
@@ -558,6 +618,7 @@ Focus on issue-specific telemetry only. Be decisive. Provide actionable next ste
                     'memory_usage': telemetry_data.get('memory', {}).get('percentage'),
                     'issue_specific_data': list(telemetry_data.get('issue_specific', {}).keys())
                 },
+                'repair_cost_estimate': cost_estimate,
                 'usage': usage,
                 'metadata': metadata
             }
@@ -999,4 +1060,254 @@ def get_nearby_service_centers(request):
             'success': False,
             'error': f'Failed to fetch service centers: {str(e)}'
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['GET'])
+def scan_hardware_specs(request):
+    """
+    Scan and return detailed hardware specifications for compatibility checking
+    """
+    try:
+        specs = hardware_compatibility.get_detailed_hardware_specs()
+        
+        # Calculate power requirements
+        power_info = hardware_compatibility.calculate_power_requirements(specs)
+        specs['power_requirements'] = power_info
+        
+        return Response({
+            'success': True,
+            'hardware_specs': specs,
+            'detected_fields': _get_detected_fields(specs),
+            'missing_fields': _get_missing_fields(specs),
+        })
+        
+    except Exception as e:
+        return Response({
+            'success': False,
+            'error': f'Failed to scan hardware: {str(e)}'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+def check_upgrade_compatibility(request):
+    """
+    Check if a proposed upgrade is compatible with existing hardware
+    """
+    try:
+        # Get current system specs
+        current_system = request.data.get('current_system', {})
+        proposed_upgrade = request.data.get('proposed_upgrade', {})
+        user_inputs = request.data.get('user_inputs', {})
+        
+        # If no current system provided, scan it
+        if not current_system:
+            current_system = hardware_compatibility.get_detailed_hardware_specs()
+        
+        # Merge user inputs into current system
+        complete_system = _merge_dict_deep(current_system, user_inputs)
+        
+        # Build compatibility analysis prompt
+        compatibility_prompt = f"""
+You are a PC hardware compatibility expert. Analyze this upgrade scenario:
+
+**Current System:**
+```json
+{json.dumps(complete_system, indent=2)}
+```
+
+**Proposed Upgrade:**
+```json
+{json.dumps(proposed_upgrade, indent=2)}
+```
+
+Please analyze and provide:
+
+1. **Compatibility Status**: Is this upgrade compatible? (YES/NO/PARTIAL)
+
+2. **Detailed Analysis**: 
+   - Physical compatibility (sockets, slots, dimensions)
+   - Power requirements (PSU adequacy)
+   - Potential bottlenecks
+   - BIOS/firmware considerations
+   - Cooling requirements
+
+3. **Warnings**: List any compatibility issues or concerns
+
+4. **Recommendations**: 
+   - Better alternatives if available
+   - What else needs upgrading
+   - Budget-friendly options
+
+5. **Performance Estimate**: Expected performance improvement (percentage or qualitative)
+
+6. **Installation Notes**: Any special installation requirements
+
+Provide your response in a structured format with clear sections.
+"""
+        
+        # Use LLM to analyze compatibility
+        llm_provider = get_llm_provider()
+        result = llm_provider.complete(compatibility_prompt, temperature=0.7, max_tokens=4000)
+        
+        # Parse the response
+        analysis = result.get('content', 'Analysis completed')
+        
+        # Extract compatibility status from response
+        is_compatible = 'YES' in analysis.upper() and 'COMPATIBLE' in analysis.upper()
+        has_warnings = 'WARNING' in analysis.upper() or 'ISSUE' in analysis.upper()
+        
+        return Response({
+            'success': True,
+            'compatible': is_compatible,
+            'has_warnings': has_warnings,
+            'analysis': analysis,
+            'current_system': complete_system,
+            'proposed_upgrade': proposed_upgrade,
+            'llm_provider': llm_provider.get_provider_name(),
+        })
+        
+    except Exception as e:
+        return Response({
+            'success': False,
+            'error': f'Failed to check compatibility: {str(e)}'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+def get_upgrade_recommendations(request):
+    """
+    Get AI-powered upgrade recommendations based on current system and budget
+    """
+    try:
+        current_system = request.data.get('current_system', {})
+        budget = request.data.get('budget', 0)
+        upgrade_goal = request.data.get('goal', 'general performance')
+        user_inputs = request.data.get('user_inputs', {})
+        
+        # If no current system provided, scan it
+        if not current_system:
+            current_system = hardware_compatibility.get_detailed_hardware_specs()
+        
+        # Merge user inputs
+        complete_system = _merge_dict_deep(current_system, user_inputs)
+        
+        # Build recommendation prompt
+        recommendation_prompt = f"""
+You are a PC hardware upgrade consultant for the Indian market. Based on this system, provide upgrade recommendations:
+
+**Current System:**
+```json
+{json.dumps(complete_system, indent=2)}
+```
+
+**Budget**: ₹{budget:,.0f} INR (Indian Rupees)
+**Upgrade Goal**: {upgrade_goal}
+
+Please provide:
+
+1. **Priority Upgrades**: What should be upgraded first and why?
+
+2. **Specific Component Recommendations**: 
+   - Exact models/specifications available in India
+   - Expected price range in INR
+   - Why this component
+
+3. **Budget Allocation**: How to split the ₹{budget:,.0f} budget across components
+
+4. **Compatibility Notes**: Ensure all recommendations are compatible
+
+5. **Expected Performance Gains**: What improvements to expect
+
+6. **Future-Proofing**: How long will these upgrades last?
+
+7. **Alternative Options**: 
+   - Budget-friendly alternatives available in India
+   - Premium options if budget allows
+
+8. **Where to Buy**: Mention reliable Indian retailers (Amazon.in, Flipkart, MDComputers, Vedant Computers, etc.)
+
+Provide practical, specific recommendations with current Indian market prices and availability.
+"""
+        
+        # Use LLM to generate recommendations
+        llm_provider = get_llm_provider()
+        result = llm_provider.complete(recommendation_prompt, temperature=0.7, max_tokens=4000)
+        
+        recommendations = result.get('content', 'Recommendations generated')
+        
+        return Response({
+            'success': True,
+            'recommendations': recommendations,
+            'current_system': complete_system,
+            'budget': budget,
+            'goal': upgrade_goal,
+            'llm_provider': llm_provider.get_provider_name(),
+        })
+        
+    except Exception as e:
+        return Response({
+            'success': False,
+            'error': f'Failed to generate recommendations: {str(e)}'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+def _get_detected_fields(specs: Dict[str, Any]) -> List[str]:
+    """Get list of successfully detected hardware fields"""
+    detected = []
+    
+    def check_dict(d, prefix=''):
+        for key, value in d.items():
+            full_key = f"{prefix}.{key}" if prefix else key
+            if isinstance(value, dict):
+                check_dict(value, full_key)
+            elif value is not None and value != '' and value != []:
+                detected.append(full_key)
+    
+    check_dict(specs)
+    return detected
+
+
+def _get_missing_fields(specs: Dict[str, Any]) -> List[str]:
+    """Get list of fields that need user input"""
+    missing = []
+    
+    # Important fields that are typically None and need user input
+    important_fields = [
+        'psu.wattage',
+        'psu.efficiency',
+        'case.form_factor',
+        'case.gpu_clearance_mm',
+        'motherboard.ram_slots',
+        'motherboard.max_ram_gb',
+    ]
+    
+    def get_nested_value(d, path):
+        keys = path.split('.')
+        value = d
+        for key in keys:
+            if isinstance(value, dict):
+                value = value.get(key)
+            else:
+                return None
+        return value
+    
+    for field in important_fields:
+        value = get_nested_value(specs, field)
+        if value is None or value == '':
+            missing.append(field)
+    
+    return missing
+
+
+def _merge_dict_deep(base: Dict, updates: Dict) -> Dict:
+    """Deep merge two dictionaries"""
+    result = base.copy()
+    
+    for key, value in updates.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _merge_dict_deep(result[key], value)
+        else:
+            result[key] = value
+    
+    return result
 

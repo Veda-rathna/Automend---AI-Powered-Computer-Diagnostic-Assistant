@@ -10,6 +10,8 @@ which doesn't require AutoGen installation.
 import logging
 import json
 import os
+import time
+import copy
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 
@@ -141,10 +143,14 @@ class AutoGenOrchestrator:
             logger.info(f"Executing {len(tasks)} MCP tasks")
             
             # Choose execution method
+            execution_start = time.perf_counter()
             if use_autogen:
                 results = self._execute_with_autogen(tasks, summary)
             else:
                 results = self._execute_direct(tasks, summary)
+
+            total_execution_time_ms = round((time.perf_counter() - execution_start) * 1000, 2)
+            slowest_task = max(results, key=lambda r: r.get('execution_time_ms', 0), default={})
             
             return {
                 "success": True,
@@ -153,6 +159,12 @@ class AutoGenOrchestrator:
                 "tasks_failed": len([r for r in results if not r.get('success')]),
                 "summary": summary,
                 "results": results,
+                "total_execution_time_ms": total_execution_time_ms,
+                "slowest_task": {
+                    "task": slowest_task.get('task', 'Unknown Task'),
+                    "category": slowest_task.get('category', 'unknown'),
+                    "execution_time_ms": slowest_task.get('execution_time_ms', 0)
+                },
                 "user_message": self.task_parser.get_user_friendly_message(model_output),
                 "execution_timestamp": datetime.now().isoformat()
             }
@@ -179,6 +191,7 @@ class AutoGenOrchestrator:
             List of execution results
         """
         results = []
+        tool_result_cache: Dict[str, Dict[str, Any]] = {}
         
         # Categorize tasks
         categorized = self.task_parser.categorize_tasks(tasks)
@@ -191,7 +204,21 @@ class AutoGenOrchestrator:
             
             for task in category_tasks:
                 try:
-                    result = self._execute_single_task_direct(task, category)
+                    task_start = time.perf_counter()
+                    cache_key = self._get_cache_key_for_task(task, category)
+
+                    if cache_key and cache_key in tool_result_cache:
+                        result = copy.deepcopy(tool_result_cache[cache_key])
+                        result["from_cache"] = True
+                    else:
+                        result = self._execute_single_task_direct(task, category)
+                        if cache_key:
+                            tool_result_cache[cache_key] = copy.deepcopy(result)
+
+                    result["task"] = task
+                    result["category"] = category
+                    result["execution_time_ms"] = round((time.perf_counter() - task_start) * 1000, 2)
+
                     results.append(result)
                 except Exception as e:
                     logger.error(f"Error executing task '{task}': {str(e)}")
@@ -199,10 +226,35 @@ class AutoGenOrchestrator:
                         "success": False,
                         "task": task,
                         "category": category,
-                        "error": str(e)
+                        "error": str(e),
+                        "execution_time_ms": 0
                     })
         
         return results
+
+    def _get_cache_key_for_task(self, task: str, category: str) -> Optional[str]:
+        """
+        Map a task/category to a stable cache key so expensive diagnostics
+        run once per request, even if multiple tasks request the same check.
+        """
+        task_lower = task.lower()
+
+        if category == 'thermal' or 'cpu' in task_lower or 'thermal' in task_lower or 'temperature' in task_lower:
+            return 'cpu_thermal'
+        if category == 'disk' or 'disk' in task_lower or 'storage' in task_lower:
+            return 'disk_usage'
+        if category == 'memory' or 'memory' in task_lower or 'ram' in task_lower:
+            return 'memory_usage'
+        if category == 'power' or 'power' in task_lower or 'battery' in task_lower:
+            return 'power_settings'
+        if category == 'event_log' or 'event' in task_lower or 'log' in task_lower or 'crash' in task_lower:
+            return 'event_logs'
+        if 'dism' in task_lower:
+            return 'dism_health'
+        if category == 'system_files' or 'sfc' in task_lower or 'system file' in task_lower:
+            return 'system_file_scan'
+
+        return None
     
     def _execute_single_task_direct(self, task: str, category: str) -> Dict[str, Any]:
         """

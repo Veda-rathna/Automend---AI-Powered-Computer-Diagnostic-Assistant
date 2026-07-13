@@ -22,6 +22,7 @@ An intelligent, full-stack application that leverages AI and AutoGen agents to d
 - AI-driven conversational PC diagnostics
 - Multi-agent system using AutoGen framework
 - Real-time hardware telemetry collection
+- **PC Upgrade Compatibility Checker** - Check component compatibility and get upgrade recommendations
 - Google Gemini integration with intelligent fallbacks
 - Automated report generation
 - Service center recommendations
@@ -160,7 +161,8 @@ The system implements a robust three-tier fallback mechanism:
 
 ### Key Backend Components
 
-- **`pc_diagnostic/views.py`**: Main prediction endpoint
+- **`pc_diagnostic/views.py`**: Main prediction endpoint and compatibility checking
+- **`pc_diagnostic/hardware_compatibility.py`**: Hardware detection and compatibility analysis
 - **`pc_diagnostic/llm/`**: LLM provider implementations
 - **`pc_diagnostic/advanced_telemetry.py`**: Hardware monitoring
 - **`autogen_integration/`**: Multi-agent orchestration
@@ -168,7 +170,8 @@ The system implements a robust three-tier fallback mechanism:
 
 ### Key Frontend Components
 
-- **`src/App.js`**: Main application component
+- **`src/App.js`**: Main application component with routing
+- **`src/pages/CompatibilityChecker.js`**: PC upgrade compatibility checker
 - **`src/components/`**: UI components
 - **`src/pages/`**: Page layouts
 
@@ -274,6 +277,15 @@ Get-ChildItem -Recurse -Filter "*.pyc" | Remove-Item -Force
 - Cleaned up redundant documentation files
 - Created comprehensive DOCS.md
 - Streamlined project structure
+
+**Phase 5: PC Upgrade Compatibility Checker (February 15, 2026)**
+- Added comprehensive hardware detection and specification scanning
+- Implemented AI-powered upgrade compatibility checking
+- Created upgrade recommendation engine
+- Built interactive frontend page with tabbed interface
+- Integrated power requirement calculations
+- Added socket detection for Intel/AMD CPUs
+- Implemented RAM, GPU, and storage detection
 
 ### Verification Checklist
 

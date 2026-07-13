@@ -541,6 +541,52 @@
   line-height: 1.6;
 }
 
+.repair-cost-card {
+  margin-top: 16px;
+  padding: 14px 16px;
+  background: linear-gradient(135deg, #102218 0%, #133124 100%);
+  border: 1px solid #2f855a;
+  border-radius: 10px;
+}
+
+.repair-cost-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.repair-cost-icon {
+  font-size: 1.25rem;
+}
+
+.repair-cost-header h4 {
+  margin: 0;
+  color: #9ae6b4;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.repair-cost-range {
+  margin: 0 0 6px 0;
+  color: #f0fff4;
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.repair-cost-reason,
+.repair-cost-note {
+  margin: 0;
+  color: #d1fae5;
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+
+.repair-cost-note {
+  margin-top: 4px;
+  color: #a7f3d0;
+}
+
 .hardware-navigation-buttons {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
@@ -633,5 +679,14 @@
   
   .hardware-recommendation {
     font-size: 0.875rem;
+  }
+
+  .repair-cost-range {
+    font-size: 0.9375rem;
+  }
+
+  .repair-cost-reason,
+  .repair-cost-note {
+    font-size: 0.8125rem;
   }
 }

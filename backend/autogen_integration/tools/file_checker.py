@@ -67,7 +67,8 @@ class SystemFileChecker:
                 # Full scan: sfc /scannow
                 # Verify only: sfc /verifyonly
                 cmd = "sfc /verifyonly"
-                output = subprocess.check_output(cmd, shell=True, text=True, timeout=600)  # 10 minute timeout
+                # Keep interactive API responses responsive by capping automated SFC runtime.
+                output = subprocess.check_output(cmd, shell=True, text=True, timeout=120)
                 
                 result["data"]["scan_output"] = output
                 
@@ -87,7 +88,7 @@ class SystemFileChecker:
                     result["severity"] = "medium"
                 
             except subprocess.TimeoutExpired:
-                result["data"]["scan_note"] = "SFC scan timed out after 10 minutes"
+                result["data"]["scan_note"] = "SFC scan timed out after 2 minutes"
                 result["recommendation"] = "Run SFC scan manually: sfc /scannow"
             except subprocess.CalledProcessError as e:
                 result["data"]["scan_note"] = f"SFC scan returned error code {e.returncode}"

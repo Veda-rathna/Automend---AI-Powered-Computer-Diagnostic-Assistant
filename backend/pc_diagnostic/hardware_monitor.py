@@ -91,6 +91,102 @@ class HardwareMonitor:
                 "success": False
             }
 
+    def _parse_json_output(self, stdout):
+        """Parse command JSON output and normalize to a list of dicts."""
+        if not stdout:
+            return []
+
+        try:
+            parsed = json.loads(stdout)
+        except Exception:
+            return []
+
+        if isinstance(parsed, list):
+            return [item for item in parsed if isinstance(item, dict)]
+        if isinstance(parsed, dict):
+            return [parsed]
+        return []
+
+    def _load_display_info_from_powershell(self, display_data):
+        """Fallback display detection using CIM via PowerShell on Windows."""
+        if platform.system() != "Windows":
+            return
+
+        # GPU controllers (integrated + dedicated)
+        if not display_data["graphics_cards"]:
+            gpu_cmd = (
+                "Get-CimInstance Win32_VideoController | "
+                "Select-Object Name,DeviceID,PNPDeviceID,AdapterRAM,DriverVersion,DriverDate,Status,"
+                "CurrentRefreshRate,CurrentHorizontalResolution,CurrentVerticalResolution | "
+                "ConvertTo-Json -Depth 4"
+            )
+            gpu_result = self.run_terminal_command(gpu_cmd, timeout=20)
+            if gpu_result.get("success"):
+                for gpu in self._parse_json_output(gpu_result.get("stdout", "")):
+                    display_data["graphics_cards"].append({
+                        "name": gpu.get("Name"),
+                        "device_id": gpu.get("DeviceID"),
+                        "pnp_device_id": gpu.get("PNPDeviceID"),
+                        "adapter_ram": gpu.get("AdapterRAM"),
+                        "driver_version": gpu.get("DriverVersion"),
+                        "driver_date": str(gpu.get("DriverDate")) if gpu.get("DriverDate") else None,
+                        "status": gpu.get("Status"),
+                        "current_refresh_rate": gpu.get("CurrentRefreshRate"),
+                        "current_horizontal_resolution": gpu.get("CurrentHorizontalResolution"),
+                        "current_vertical_resolution": gpu.get("CurrentVerticalResolution"),
+                        "source": "powershell_cim"
+                    })
+            elif gpu_result.get("stderr"):
+                display_data["errors"].append(f"PowerShell GPU fallback error: {gpu_result.get('stderr')}")
+
+        # Monitor devices
+        if not display_data["monitors"]:
+            monitor_cmd = (
+                "Get-CimInstance Win32_DesktopMonitor | "
+                "Select-Object Name,DeviceID,PNPDeviceID,ScreenWidth,ScreenHeight,Status,Availability,MonitorType | "
+                "ConvertTo-Json -Depth 4"
+            )
+            monitor_result = self.run_terminal_command(monitor_cmd, timeout=20)
+            if monitor_result.get("success"):
+                for monitor in self._parse_json_output(monitor_result.get("stdout", "")):
+                    display_data["monitors"].append({
+                        "name": monitor.get("Name"),
+                        "device_id": monitor.get("DeviceID"),
+                        "pnp_device_id": monitor.get("PNPDeviceID"),
+                        "screen_width": monitor.get("ScreenWidth"),
+                        "screen_height": monitor.get("ScreenHeight"),
+                        "status": monitor.get("Status"),
+                        "availability": monitor.get("Availability"),
+                        "monitor_type": monitor.get("MonitorType"),
+                        "source": "powershell_cim"
+                    })
+            elif monitor_result.get("stderr"):
+                display_data["errors"].append(f"PowerShell monitor fallback error: {monitor_result.get('stderr')}")
+
+        # Display drivers
+        if not display_data["display_drivers"]:
+            driver_cmd = (
+                "Get-CimInstance Win32_PnPSignedDriver | "
+                "Where-Object { $_.DeviceClass -eq 'DISPLAY' } | "
+                "Select-Object DeviceName,DeviceID,DriverVersion,DriverDate,Manufacturer,DriverProviderName,IsSigned | "
+                "ConvertTo-Json -Depth 4"
+            )
+            driver_result = self.run_terminal_command(driver_cmd, timeout=20)
+            if driver_result.get("success"):
+                for driver in self._parse_json_output(driver_result.get("stdout", "")):
+                    display_data["display_drivers"].append({
+                        "device_name": driver.get("DeviceName"),
+                        "device_id": driver.get("DeviceID"),
+                        "driver_version": driver.get("DriverVersion"),
+                        "driver_date": str(driver.get("DriverDate")) if driver.get("DriverDate") else None,
+                        "manufacturer": driver.get("Manufacturer"),
+                        "provider": driver.get("DriverProviderName"),
+                        "is_signed": driver.get("IsSigned"),
+                        "source": "powershell_cim"
+                    })
+            elif driver_result.get("stderr"):
+                display_data["errors"].append(f"PowerShell display-driver fallback error: {driver_result.get('stderr')}")
+
     def identify_issue_type(self, user_input):
         """Identify the type of issue based on user input"""
         user_input_lower = user_input.lower()
@@ -220,6 +316,9 @@ class HardwareMonitor:
                         display_data["graphics_cards"].append(gpu_util)
             except Exception as e:
                 display_data["errors"].append(f"GPU utilization error: {str(e)}")
+
+        # Fallback detection path for systems where WMI/GPUtil returns empty sets.
+        self._load_display_info_from_powershell(display_data)
 
         return display_data
 
